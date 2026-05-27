@@ -1,13 +1,14 @@
 """
 imap_downloader.py
-Descarga adjuntos XML y ZIP desde cuentas Gmail vía IMAP.
-Compatible con Gmail usando App Passwords (contraseñas de aplicación).
+Descarga adjuntos XML y PDF desde cuentas de correo vía IMAP.
+Compatible con Gmail (App Passwords) y Outlook/Hotmail/Live.
 """
 
 import imaplib
 import email
 import zipfile
 import io
+import socket
 import calendar
 from email.header import decode_header
 from pathlib import Path
@@ -23,23 +24,54 @@ _IMAP_MONTHS = [
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ]
 
-# Posibles nombres de la carpeta "Todos los correos" en Gmail
-_ALL_MAIL_CANDIDATES = [
-    '"[Gmail]/All Mail"',
-    '"[Gmail]/Todos los correos"',
-    '"[Gmail]/Tous les messages"',
-    '"[Gmail]/Alle Nachrichten"',
-    "INBOX",
-]
+# Configuración IMAP por proveedor
+# clave: sufijos de dominio que identifican al proveedor
+_IMAP_PROVIDERS = {
+    "gmail": {
+        "domains":  ["gmail.com", "googlemail.com"],
+        "host":     "imap.gmail.com",
+        "port":     993,
+        "requires_app_password": True,
+    },
+    "outlook": {
+        "domains":  [
+            "outlook.com", "hotmail.com", "hotmail.es", "hotmail.co",
+            "live.com", "live.com.ar", "msn.com", "microsoft.com",
+        ],
+        "host":     "outlook.office365.com",
+        "port":     993,
+        "requires_app_password": False,
+    },
+}
+
+_DEFAULT_PROVIDER = {
+    "host": "imap.gmail.com",
+    "port": 993,
+    "requires_app_password": True,
+}
+
+
+def get_imap_config(email_address: str) -> dict:
+    """
+    Retorna la configuración IMAP correcta según el dominio del correo.
+    Incluye host, port y si requiere contraseña de aplicación.
+    """
+    domain = email_address.split("@")[-1].lower().strip() if "@" in email_address else ""
+    for provider in _IMAP_PROVIDERS.values():
+        if any(domain == d or domain.endswith("." + d)
+               for d in provider["domains"]):
+            return provider
+    return _DEFAULT_PROVIDER
 
 
 class IMAPDownloader:
     """
-    Gestiona la conexión IMAP a Gmail y la descarga de adjuntos XML/ZIP.
+    Gestiona la conexión IMAP y la descarga de adjuntos XML/PDF/ZIP.
+    Soporta Gmail (contraseña de aplicación) y Outlook/Hotmail/Live
+    (contraseña normal de la cuenta).
     """
 
-    IMAP_HOST = "imap.gmail.com"
-    IMAP_PORT = 993
+    IMAP_TIMEOUT = 30   # segundos
 
     def __init__(
         self,
@@ -48,9 +80,14 @@ class IMAPDownloader:
         log: Optional[Callable[[str], None]] = None,
     ):
         self.email_address = email_address
-        self.password = password
-        self.log = log or print
+        self.password      = password
+        self.log           = log or print
         self._mail: Optional[imaplib.IMAP4_SSL] = None
+
+        # Detectar proveedor automáticamente
+        self._provider = get_imap_config(email_address)
+        self.IMAP_HOST = self._provider["host"]
+        self.IMAP_PORT = self._provider["port"]
 
     # ------------------------------------------------------------------
     # Conexión
@@ -58,9 +95,11 @@ class IMAPDownloader:
 
     def connect(self):
         """Establece la conexión IMAP y autentica."""
+        socket.setdefaulttimeout(self.IMAP_TIMEOUT)
         self._mail = imaplib.IMAP4_SSL(self.IMAP_HOST, self.IMAP_PORT)
         self._mail.login(self.email_address, self.password)
-        self.log(f"   ✓ Conectado a {self.email_address}")
+        proveedor = "Outlook" if "outlook" in self.IMAP_HOST else "Gmail"
+        self.log(f"   ✓ Conectado a {self.email_address} ({proveedor})")
 
     def disconnect(self):
         """Cierra la sesión IMAP de forma segura."""
@@ -176,25 +215,69 @@ class IMAPDownloader:
         month: int,
         existing_files: set,
     ) -> tuple:
-        """Extrae y guarda los adjuntos XML, PDF y ZIP de un mensaje."""
+        """
+        Extrae y guarda los adjuntos XML, PDF y ZIP de un mensaje.
+
+        Cubre tres casos adicionales sobre la implementación básica:
+          1. Adjuntos inline (sin Content-Disposition o con disposition=inline)
+             — algunos proveedores omiten el header o usan inline en lugar de attachment.
+          2. Correos reenviados (message/rfc822) — desciende al mensaje embebido
+             y procesa sus adjuntos recursivamente.
+          3. ZIP dentro de ZIP — _extract_zip recursa un nivel.
+        """
         count = 0
         skipped = 0
         type_counts: dict = {}
         errors = 0
 
         for part in msg.walk():
-            if part.get_content_maintype() == "multipart":
-                continue
-            if not part.get("Content-Disposition"):
+            content_type = part.get_content_type()
+
+            # Caso: correo reenviado — el adjunto es un mensaje completo embebido
+            if content_type == "message/rfc822":
+                inner_msgs = part.get_payload()
+                if not isinstance(inner_msgs, list):
+                    inner_msgs = [inner_msgs]
+                for inner in inner_msgs:
+                    try:
+                        c, sk, tc, err = self._process_attachments(
+                            inner, folder_mgr, xml_classifier,
+                            client_name, year, month, existing_files
+                        )
+                        count += c; skipped += sk; errors += err
+                        for k, v in tc.items():
+                            type_counts[k] = type_counts.get(k, 0) + v
+                    except Exception as e:
+                        errors += 1
+                        self.log(f"     ⚠ Error en mensaje embebido: {e}")
                 continue
 
+            if part.get_content_maintype() == "multipart":
+                continue
+
+            # Determinar nombre de archivo — admite tanto attachment como inline
+            disposition = part.get("Content-Disposition", "")
             filename = self._decode_filename(part.get_filename() or "")
+
+            # Si no hay nombre en Content-Disposition, intentar desde Content-Type
+            if not filename:
+                filename = self._decode_filename(
+                    part.get_param("name", header="Content-Type") or ""
+                )
+
+            # Si sigue sin nombre, omitir (no es un adjunto de interés)
             if not filename:
                 continue
 
+            # Sanitizar nombre antes de cualquier comparación o guardado
+            filename_original = filename
+            filename = self._sanitize_filename(filename)
+            if filename != filename_original:
+                self.log(f"     ℹ Nombre sanitizado: '{filename_original}' → '{filename}'")
+
             filename_lower = filename.lower()
 
-            # Filtro anti-duplicados: omitir si ya existe en la carpeta del mes
+            # Filtro anti-duplicados
             if filename_lower in existing_files:
                 skipped += 1
                 continue
@@ -203,7 +286,7 @@ class IMAPDownloader:
                 if filename_lower.endswith(".xml"):
                     data = part.get_payload(decode=True)
                     if data:
-                        saved, doc_type = self._save_xml(
+                        saved, doc_type, *_ = self._save_xml(
                             data, filename, folder_mgr, xml_classifier,
                             client_name, year, month
                         )
@@ -251,12 +334,35 @@ class IMAPDownloader:
         year: int,
         month: int,
     ) -> tuple:
-        """Clasifica y guarda un XML. Retorna (éxito, nombre_tipo)."""
+        """
+        Clasifica y guarda un XML.
+
+        Usa la fecha de emisión del comprobante (FechaEmision) para determinar
+        el mes/año de destino. Si el XML no contiene fecha legible, se usa el
+        mes/año del correo como fallback (comportamiento anterior).
+
+        Retorna (éxito, nombre_tipo, año_real, mes_real).
+        """
         doc_type = xml_classifier.classify(data)
-        dest_dir = folder_mgr.ensure_subfolder(client_name, year, month, doc_type)
+
+        # Intentar leer la fecha real del comprobante
+        doc_date = xml_classifier.extract_date(data)
+        if doc_date and (doc_date.year, doc_date.month) != (year, month):
+            dest_year  = doc_date.year
+            dest_month = doc_date.month
+            self.log(
+                f"     ℹ Comprobante con fecha {doc_date.strftime('%Y-%m-%d')} "
+                f"→ guardado en {dest_year}/{folder_mgr.month_label(dest_month)} "
+                f"(correo era de {year}/{folder_mgr.month_label(month)})"
+            )
+        else:
+            dest_year  = year
+            dest_month = month
+
+        dest_dir = folder_mgr.ensure_subfolder(client_name, dest_year, dest_month, doc_type)
         filepath = folder_mgr.unique_filepath(dest_dir, filename)
         filepath.write_bytes(data)
-        return True, doc_type
+        return True, doc_type, dest_year, dest_month
 
     def _save_pdf(
         self,
@@ -284,8 +390,13 @@ class IMAPDownloader:
         year: int,
         month: int,
         existing_files: set,
+        _depth: int = 0,
     ) -> tuple:
-        """Extrae XMLs y PDFs de un ZIP. Retorna (count, skipped, type_counts)."""
+        """
+        Extrae XMLs y PDFs de un ZIP. Retorna (count, skipped, type_counts).
+        Soporta un nivel de recursión para ZIPs dentro de ZIPs (_depth máximo: 1).
+        """
+        MAX_ZIP_DEPTH = 1
         count = 0
         skipped = 0
         type_counts: dict = {}
@@ -294,6 +405,7 @@ class IMAPDownloader:
                 for info in zf.infolist():
                     fname_lower = info.filename.lower()
                     fname = Path(info.filename).name
+                    fname = self._sanitize_filename(fname)
 
                     if fname.lower() in existing_files:
                         skipped += 1
@@ -301,7 +413,7 @@ class IMAPDownloader:
 
                     if fname_lower.endswith(".xml"):
                         xml_data = zf.read(info.filename)
-                        saved, doc_type = self._save_xml(
+                        saved, doc_type, *_ = self._save_xml(
                             xml_data, fname, folder_mgr, xml_classifier,
                             client_name, year, month
                         )
@@ -320,6 +432,18 @@ class IMAPDownloader:
                             existing_files.add(fname.lower())
                             type_counts["PDFs"] = type_counts.get("PDFs", 0) + 1
 
+                    elif fname_lower.endswith(".zip") and _depth < MAX_ZIP_DEPTH:
+                        self.log(f"     ℹ ZIP anidado encontrado: '{fname}' — extrayendo")
+                        inner_data = zf.read(info.filename)
+                        c, sk, tc = self._extract_zip(
+                            inner_data, folder_mgr, xml_classifier,
+                            client_name, year, month, existing_files,
+                            _depth=_depth + 1,
+                        )
+                        count += c; skipped += sk
+                        for k, v in tc.items():
+                            type_counts[k] = type_counts.get(k, 0) + v
+
         except zipfile.BadZipFile:
             self.log("     ⚠ Archivo ZIP corrupto o inválido, omitiendo.")
         return count, skipped, type_counts
@@ -328,13 +452,62 @@ class IMAPDownloader:
     # Utilidades
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _sanitize_filename(filename: str) -> str:
+        """
+        Elimina o reemplaza caracteres inválidos en nombres de archivo de Windows.
+        Caracteres prohibidos: \\ / : * ? " < > |
+        También elimina caracteres de control (saltos de línea, tabs, etc.),
+        limpia espacios/puntos al final, y nombres reservados del sistema
+        (CON, PRN, AUX, NUL, COM1-9, LPT1-9).
+        Si el nombre queda vacío tras la limpieza, devuelve '_sin_nombre'.
+        """
+        import re as _re
+
+        # Eliminar caracteres de control (incluye \n, \r, \t y otros)
+        sanitized = _re.sub(r'[\x00-\x1f\x7f]', '', filename)
+
+        # Reemplazar caracteres inválidos de Windows por guion bajo
+        sanitized = _re.sub(r'[\\/:*?"<>|]', "_", sanitized)
+
+        # Colapsar espacios múltiples que pudieran quedar tras eliminar \n
+        sanitized = _re.sub(r'  +', ' ', sanitized).strip()
+
+        # Quitar espacios y puntos al final del nombre (antes de la extensión)
+        stem, _, ext = sanitized.rpartition(".")
+        if stem:
+            stem = stem.rstrip(" .")
+            sanitized = f"{stem}.{ext}" if ext else stem
+        else:
+            sanitized = sanitized.rstrip(" .")
+
+        # Nombres reservados de Windows (case-insensitive)
+        _RESERVED = {
+            "CON", "PRN", "AUX", "NUL",
+            *(f"COM{i}" for i in range(1, 10)),
+            *(f"LPT{i}" for i in range(1, 10)),
+        }
+        name_upper = sanitized.upper().rpartition(".")[0] or sanitized.upper()
+        if name_upper in _RESERVED:
+            sanitized = f"_{sanitized}"
+
+        return sanitized or "_sin_nombre"
+
     def _find_all_mail_folder(self) -> str:
-        """Detecta el nombre correcto de la carpeta 'Todos los correos' de Gmail."""
+        """
+        Detecta la carpeta correcta para buscar todos los correos.
+        - Gmail: busca la carpeta con atributo \\All (Todos los correos)
+        - Outlook y otros: usa INBOX directamente
+        """
+        # Outlook no tiene carpeta "All Mail" — INBOX contiene todo
+        if "outlook" in self.IMAP_HOST or "office365" in self.IMAP_HOST:
+            return "INBOX"
+
+        # Gmail: buscar carpeta con atributo \All
         try:
             _, folders = self._mail.list()
             for folder_info in folders:
                 if folder_info and b"\\All" in folder_info:
-                    # Extraer el nombre de la carpeta
                     parts = folder_info.decode("utf-8").split('"')
                     if len(parts) >= 2:
                         return f'"{parts[-2]}"'
